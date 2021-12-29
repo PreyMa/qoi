@@ -269,7 +269,7 @@ number of channels (3 = RGB, 4 = RGBA) and the colorspace.
 The function returns 0 on failure (invalid parameters, or fopen or malloc
 failed) or the number of bytes written on success. */
 
-int qoi_write(const char *filename, const void *data, const qoi_desc *desc);
+int qoi_write(const char* filename, const void* data, const qoi_desc* desc);
 
 
 /* Read and decode a QOI image from the file system. If channels is 0, the
@@ -282,7 +282,7 @@ will be filled with the description from the file header.
 
 The returned pixel data should be free()d after use. */
 
-void *qoi_read(const char *filename, qoi_desc *desc, int channels);
+void* qoi_read(const char* filename, qoi_desc* desc, int channels);
 
 #endif /* QOI_NO_STDIO */
 
@@ -295,7 +295,7 @@ is set to the size in bytes of the encoded data.
 
 The returned qoi data should be free()d after use. */
 
-void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len);
+void* qoi_encode(const void* data, const qoi_desc* desc, int* out_len);
 
 
 /* Decode a QOI image from memory.
@@ -306,7 +306,7 @@ is filled with the description from the file header.
 
 The returned pixel data should be free()d after use. */
 
-void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels);
+void* qoi_decode(const void* data, int size, qoi_desc* desc, int channels);
 
 
 #ifdef __cplusplus
@@ -319,8 +319,11 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels);
 Implementation */
 
 #ifdef QOI_IMPLEMENTATION
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <assert.h>
+
 
 #ifndef QOI_MALLOC
 	#define QOI_MALLOC(sz) malloc(sz)
@@ -345,6 +348,10 @@ Implementation */
 	 ((unsigned int)'i') <<  8 | ((unsigned int)'f'))
 #define QOI_HEADER_SIZE 14
 
+#define QOI_HUFF_MAX_BIT_NUM 32
+#define QOI_HUFF_ENCODED_BIT 0x80
+#define QOI_HUFF_DECODING_TABLE_WIDTH 11
+
 /* 2GB is the max file size that this implementation can safely handle. We guard
 against anything larger than that, assuming the worst case with 5 bytes per
 pixel, rounded down to a nice clean value. 400 million pixels ought to be
@@ -356,16 +363,40 @@ typedef union {
 	unsigned int v;
 } qoi_rgba_t;
 
-static const unsigned char qoi_padding[8] = {0,0,0,0,0,0,0,1};
+static const unsigned char qoi_padding[8] = { 0,0,0,0,0,0,0,1 };
 
-static void qoi_write_32(unsigned char *bytes, int *p, unsigned int v) {
+void qoi_write_16(unsigned char* bytes, int* p, unsigned int v) {
+	bytes[(*p)++] = (0x0000ff00 & v) >> 8;
+	bytes[(*p)++] = (0x000000ff & v);
+}
+
+void qoi_write_24(unsigned char* bytes, int* p, unsigned int v) {
+	bytes[(*p)++] = (0x00ff0000 & v) >> 16;
+	bytes[(*p)++] = (0x0000ff00 & v) >> 8;
+	bytes[(*p)++] = (0x000000ff & v);
+}
+
+void qoi_write_32(unsigned char* bytes, int* p, unsigned int v) {
 	bytes[(*p)++] = (0xff000000 & v) >> 24;
 	bytes[(*p)++] = (0x00ff0000 & v) >> 16;
 	bytes[(*p)++] = (0x0000ff00 & v) >> 8;
 	bytes[(*p)++] = (0x000000ff & v);
 }
 
-static unsigned int qoi_read_32(const unsigned char *bytes, int *p) {
+unsigned int qoi_read_16(const unsigned char* bytes, int* p) {
+	unsigned int c = bytes[(*p)++];
+	unsigned int d = bytes[(*p)++];
+	return c << 8 | d;
+}
+
+unsigned int qoi_read_24(const unsigned char* bytes, int* p) {
+	unsigned int b = bytes[(*p)++];
+	unsigned int c = bytes[(*p)++];
+	unsigned int d = bytes[(*p)++];
+	return b << 16 | c << 8 | d;
+}
+
+unsigned int qoi_read_32(const unsigned char* bytes, int* p) {
 	unsigned int a = bytes[(*p)++];
 	unsigned int b = bytes[(*p)++];
 	unsigned int c = bytes[(*p)++];
@@ -373,11 +404,29 @@ static unsigned int qoi_read_32(const unsigned char *bytes, int *p) {
 	return a << 24 | b << 16 | c << 8 | d;
 }
 
-void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
+__forceinline void qoi_write_32_histo(unsigned char* bytes, int* p, unsigned int* histo, unsigned int v) {
+	bytes[(*p)++] = (0xff000000 & v) >> 24;
+	bytes[(*p)++] = (0x00ff0000 & v) >> 16;
+	bytes[(*p)++] = (0x0000ff00 & v) >> 8;
+	bytes[(*p)++] = (0x000000ff & v);
+
+	histo[(0xff000000 & v) >> 24]++;
+	histo[(0x00ff0000 & v) >> 16]++;
+	histo[(0x0000ff00 & v) >> 8]++;
+	histo[(0x000000ff & v)]++;
+}
+
+__forceinline void qoi_write_8_histo(unsigned char* bytes, int* p, unsigned int* histo, unsigned char v) {
+	bytes[(*p)++] = v;
+	histo[v]++;
+}
+
+
+void* qoi_encode(const void* data, const qoi_desc* desc, int* out_len) {
 	int i, max_size, p, run;
 	int px_len, px_end, px_pos, channels;
-	unsigned char *bytes;
-	const unsigned char *pixels;
+	unsigned char* bytes;
+	const unsigned char* pixels;
 	qoi_rgba_t index[64];
 	qoi_rgba_t px, px_prev;
 
@@ -387,7 +436,7 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 		desc->channels < 3 || desc->channels > 4 ||
 		desc->colorspace > 1 ||
 		desc->height >= QOI_PIXELS_MAX / desc->width
-	) {
+		) {
 		return NULL;
 	}
 
@@ -396,7 +445,7 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 		QOI_HEADER_SIZE + sizeof(qoi_padding);
 
 	p = 0;
-	bytes = (unsigned char *) QOI_MALLOC(max_size);
+	bytes = (unsigned char*)QOI_MALLOC(max_size);
 	if (!bytes) {
 		return NULL;
 	}
@@ -408,7 +457,7 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 	bytes[p++] = desc->colorspace;
 
 
-	pixels = (const unsigned char *)data;
+	pixels = (const unsigned char*)data;
 
 	QOI_ZEROARR(index);
 
@@ -425,7 +474,7 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 
 	for (px_pos = 0; px_pos < px_len; px_pos += channels) {
 		if (channels == 4) {
-			px = *(qoi_rgba_t *)(pixels + px_pos);
+			px = *(qoi_rgba_t*)(pixels + px_pos);
 		}
 		else {
 			px.rgba.r = pixels[px_pos + 0];
@@ -468,16 +517,16 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 						vr > -3 && vr < 2 &&
 						vg > -3 && vg < 2 &&
 						vb > -3 && vb < 2
-					) {
+						) {
 						bytes[p++] = QOI_OP_DIFF | (vr + 2) << 4 | (vg + 2) << 2 | (vb + 2);
 					}
 					else if (
-						vg_r >  -9 && vg_r <  8 &&
+						vg_r > -9 && vg_r <  8 &&
 						vg   > -33 && vg   < 32 &&
-						vg_b >  -9 && vg_b <  8
-					) {
-						bytes[p++] = QOI_OP_LUMA     | (vg   + 32);
-						bytes[p++] = (vg_r + 8) << 4 | (vg_b +  8);
+						vg_b >  -9 && vg_b < 8
+						) {
+						bytes[p++] = QOI_OP_LUMA | (vg + 32);
+						bytes[p++] = (vg_r + 8) << 4 | (vg_b + 8);
 					}
 					else {
 						bytes[p++] = QOI_OP_RGB;
@@ -506,10 +555,10 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 	return bytes;
 }
 
-void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
-	const unsigned char *bytes;
+void* qoi_decode(const void* data, int size, qoi_desc* desc, int channels) {
+	const unsigned char* bytes;
 	unsigned int header_magic;
-	unsigned char *pixels;
+	unsigned char* pixels;
 	qoi_rgba_t index[64];
 	qoi_rgba_t px;
 	int px_len, chunks_len, px_pos;
@@ -519,11 +568,11 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 		data == NULL || desc == NULL ||
 		(channels != 0 && channels != 3 && channels != 4) ||
 		size < QOI_HEADER_SIZE + (int)sizeof(qoi_padding)
-	) {
+		) {
 		return NULL;
 	}
 
-	bytes = (const unsigned char *)data;
+	bytes = (const unsigned char*)data;
 
 	header_magic = qoi_read_32(bytes, &p);
 	desc->width = qoi_read_32(bytes, &p);
@@ -537,7 +586,7 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 		desc->colorspace > 1 ||
 		header_magic != QOI_MAGIC ||
 		desc->height >= QOI_PIXELS_MAX / desc->width
-	) {
+		) {
 		return NULL;
 	}
 
@@ -546,7 +595,7 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 	}
 
 	px_len = desc->width * desc->height * channels;
-	pixels = (unsigned char *) QOI_MALLOC(px_len);
+	pixels = (unsigned char*)QOI_MALLOC(px_len);
 	if (!pixels) {
 		return NULL;
 	}
@@ -582,14 +631,14 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 			else if ((b1 & QOI_MASK_2) == QOI_OP_DIFF) {
 				px.rgba.r += ((b1 >> 4) & 0x03) - 2;
 				px.rgba.g += ((b1 >> 2) & 0x03) - 2;
-				px.rgba.b += ( b1       & 0x03) - 2;
+				px.rgba.b += (b1 & 0x03) - 2;
 			}
 			else if ((b1 & QOI_MASK_2) == QOI_OP_LUMA) {
 				int b2 = bytes[p++];
 				int vg = (b1 & 0x3f) - 32;
 				px.rgba.r += vg - 8 + ((b2 >> 4) & 0x0f);
 				px.rgba.g += vg;
-				px.rgba.b += vg - 8 +  (b2       & 0x0f);
+				px.rgba.b += vg - 8 + (b2 & 0x0f);
 			}
 			else if ((b1 & QOI_MASK_2) == QOI_OP_RUN) {
 				run = (b1 & 0x3f);
@@ -611,13 +660,819 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 	return pixels;
 }
 
+
+
+
+typedef struct {
+	unsigned int count;
+	short left;
+	short right;
+} encoding_tree_t;
+
+typedef struct {
+	unsigned int count;
+	unsigned int bits;
+	unsigned char len;
+} encoding_table_t;
+
+
+__forceinline void swap_min_heap(unsigned short* heap, unsigned short a, unsigned short b) {
+	unsigned short temp = heap[a];
+	heap[a] = heap[b];
+	heap[b] = temp;
+}
+
+void insert_min_heap(unsigned short* heap, int* heapSize, encoding_tree_t* tree, unsigned short item) {
+	heap[*heapSize] = item;
+	int idx = *heapSize;
+	(*heapSize)++;
+
+	assert(*heapSize <= 256);
+
+	// Heapify up
+	while (idx) {
+		int upper = (idx - 1) / 2;
+		if (tree[heap[upper]].count < tree[heap[idx]].count) {
+			break;
+		}
+
+		swap_min_heap(heap, idx, upper);
+
+		idx = upper;
+	}
+}
+
+unsigned short pop_min_heap(unsigned short heap[], int* heapSize, encoding_tree_t* tree) {
+	assert(*heapSize > 0);
+
+	unsigned short item = heap[0];
+	(*heapSize)--;
+
+	if (!*heapSize) {
+		return item;
+	}
+
+	// Move the last element to the top
+	heap[0] = heap[*heapSize];
+
+	// Heapify down
+	unsigned short idx = 0;
+	while (idx * 2 + 1 < *heapSize) {
+		unsigned short cur = heap[idx];
+		unsigned short idxLeft  = idx * 2 + 1;
+		unsigned short idxRight = (idx+1) * 2;
+		unsigned short left = heap[idxLeft];
+
+		if (idxRight < *heapSize) {
+			unsigned short right = heap[idxRight];
+
+			// Smaller than left and right -> Stop
+			if (tree[cur].count < tree[left].count && tree[cur].count < tree[right].count) {
+				break;
+			}
+
+			// Swap with the smaller child
+			if (tree[right].count < tree[left].count) {
+				swap_min_heap(heap, idxRight, idx);
+				idx = idxRight;
+			}
+			else {
+				swap_min_heap(heap, idxLeft, idx);
+				idx = idxLeft;
+			}
+		}
+		else {
+			// Smaller than only left child -> Swap
+			if (tree[left].count < tree[cur].count) {
+				swap_min_heap(heap, idxLeft, idx);
+			}
+			break;
+		}
+	}
+
+	return item;
+}
+
+
+void make_encoded_word( encoding_tree_t* tree, encoding_table_t* table, unsigned short node, unsigned int bits, unsigned char len ) {
+	assert(node >= 0);
+
+	if (node < 256) {
+		table[node] = (encoding_table_t){
+			.count = tree[node].count,
+			.bits = bits,
+			.len = len
+		};
+		return;
+	}
+
+	make_encoded_word(tree, table, tree[node].left, bits, len + 1);
+	make_encoded_word(tree, table, tree[node].right, bits | (1 << len), len + 1);
+}
+
+
+
+void* qoi_huff_encode(const void* data, const qoi_desc* desc, int* out_len) {
+	int i, max_size, p, run;
+	int px_len, px_end, px_pos, channels;
+	unsigned char* bytes;
+	const unsigned char* pixels;
+	qoi_rgba_t index[64];
+	qoi_rgba_t px, px_prev;
+
+	unsigned int histo[256];
+	memset(&histo, 0, 256* sizeof(unsigned int));
+
+	if (
+		data == NULL || out_len == NULL || desc == NULL ||
+		desc->width == 0 || desc->height == 0 ||
+		desc->channels < 3 || desc->channels > 4 ||
+		desc->colorspace > 1 ||
+		desc->height >= QOI_PIXELS_MAX / desc->width
+		) {
+		return NULL;
+	}
+
+	max_size =
+		desc->width * desc->height * (desc->channels + 1) +
+		QOI_HEADER_SIZE + sizeof(qoi_padding);
+
+	p = 0;
+	bytes = (unsigned char*)QOI_MALLOC(max_size);
+	if (!bytes) {
+		return NULL;
+	}
+
+	qoi_write_32(bytes, &p, QOI_MAGIC);
+	qoi_write_32(bytes, &p, desc->width);
+	qoi_write_32(bytes, &p, desc->height);
+	bytes[p++] = desc->channels;
+	bytes[p++] = desc->colorspace & ~QOI_HUFF_ENCODED_BIT;
+
+	pixels = (const unsigned char*)data;
+
+	QOI_ZEROARR(index);
+
+	run = 0;
+	px_prev.rgba.r = 0;
+	px_prev.rgba.g = 0;
+	px_prev.rgba.b = 0;
+	px_prev.rgba.a = 255;
+	px = px_prev;
+
+	px_len = desc->width * desc->height * desc->channels;
+	px_end = px_len - desc->channels;
+	channels = desc->channels;
+
+	for (px_pos = 0; px_pos < px_len; px_pos += channels) {
+		if (channels == 4) {
+			px = *(qoi_rgba_t*)(pixels + px_pos);
+		}
+		else {
+			px.rgba.r = pixels[px_pos + 0];
+			px.rgba.g = pixels[px_pos + 1];
+			px.rgba.b = pixels[px_pos + 2];
+		}
+
+		if (px.v == px_prev.v) {
+			run++;
+			if (run == 62 || px_pos == px_end) {
+				qoi_write_8_histo(bytes, &p, histo, QOI_OP_RUN | (run - 1));
+				run = 0;
+			}
+		}
+		else {
+			int index_pos;
+
+			if (run > 0) {
+				qoi_write_8_histo(bytes, &p, histo, QOI_OP_RUN | (run - 1));
+				run = 0;
+			}
+
+			index_pos = QOI_COLOR_HASH(px) % 64;
+
+			if (index[index_pos].v == px.v) {
+				qoi_write_8_histo(bytes, &p, histo, QOI_OP_INDEX | index_pos);
+			}
+			else {
+				index[index_pos] = px;
+
+				if (px.rgba.a == px_prev.rgba.a) {
+					signed char vr = px.rgba.r - px_prev.rgba.r;
+					signed char vg = px.rgba.g - px_prev.rgba.g;
+					signed char vb = px.rgba.b - px_prev.rgba.b;
+
+					signed char vg_r = vr - vg;
+					signed char vg_b = vb - vg;
+
+					if (
+						vr > -3 && vr < 2 &&
+						vg > -3 && vg < 2 &&
+						vb > -3 && vb < 2
+						) {
+						qoi_write_8_histo(bytes, &p, histo, QOI_OP_DIFF | (vr + 2) << 4 | (vg + 2) << 2 | (vb + 2));
+					}
+					else if (
+						vg_r > -9 && vg_r <  8 &&
+						vg   > -33 && vg   < 32 &&
+						vg_b >  -9 && vg_b < 8
+						) {
+						qoi_write_8_histo(bytes, &p, histo, QOI_OP_LUMA | (vg + 32));
+						qoi_write_8_histo(bytes, &p, histo, (vg_r + 8) << 4 | (vg_b + 8));
+					}
+					else {
+						qoi_write_8_histo(bytes, &p, histo, QOI_OP_RGB);
+						qoi_write_8_histo(bytes, &p, histo, px.rgba.r);
+						qoi_write_8_histo(bytes, &p, histo, px.rgba.g);
+						qoi_write_8_histo(bytes, &p, histo, px.rgba.b);
+					}
+				}
+				else {
+					qoi_write_8_histo(bytes, &p, histo, QOI_OP_RGBA);
+					qoi_write_8_histo(bytes, &p, histo, px.rgba.r);
+					qoi_write_8_histo(bytes, &p, histo, px.rgba.g);
+					qoi_write_8_histo(bytes, &p, histo, px.rgba.b);
+					qoi_write_8_histo(bytes, &p, histo, px.rgba.a);
+				}
+			}
+		}
+		px_prev = px;
+	}
+
+	for (i = 0; i < (int)sizeof(qoi_padding); i++) {
+		qoi_write_8_histo(bytes, &p, histo, qoi_padding[i]);
+	}
+
+	unsigned int qoiByteCount= *out_len = p;
+
+	encoding_table_t table[256];
+
+	{
+		encoding_tree_t tree[512];
+		unsigned short nextFreeNode = 256;
+
+		unsigned short minHeap[256];
+		int heapSize = 0;
+
+		memset(minHeap, -1, sizeof(short) * 256);
+
+		for (int i = 0; i != 256; i++) {
+			tree[i] = (encoding_tree_t){
+				.count = histo[i],
+				.left = -1,
+				.right = -1
+			};
+
+			insert_min_heap(minHeap, &heapSize, tree, i);
+		}
+
+		int j = 0;
+		while (heapSize > 1) {
+			short left = pop_min_heap(minHeap, &heapSize, tree);
+			short right = pop_min_heap(minHeap, &heapSize, tree);
+
+			if (tree[left].count > tree[right].count) {
+				printf("inv");
+			}
+
+			tree[nextFreeNode] = (encoding_tree_t){
+				.count = tree[left].count + tree[right].count,
+				.left = left,
+				.right = right
+			};
+
+			insert_min_heap(minHeap, &heapSize, tree, nextFreeNode);
+			nextFreeNode++;
+		}
+
+
+		make_encoded_word(tree, table, pop_min_heap(minHeap, &heapSize, tree), 0, 0);
+	}
+
+	/*for (int i = 0; i != 256; i++) {
+		printf("- %d: (%d) ", i, table[i].len);
+
+		int j = table[i].len;
+		while (j--) {
+			printf("%c", (table[i].bits& (1 << j)) ? '1' : '0');
+		}
+
+		printf(" (%04x)\n", table[i].bits);
+	}*/
+
+
+	{
+		unsigned int stats[20];
+		memset(stats, 0, sizeof(stats));
+		for (int i = 0; i != 256; i++) {
+			stats[table[i].len] ++;
+		}
+
+		/*for (int i = 0; i != 20; i++) {
+			if (stats[i]) {
+				printf("- %d bits: %d \n", i, stats[i]);
+			}
+		}*/
+	}
+
+	// Maximum dictonary size
+	unsigned int expectedSize = (1024 + 256) * 8;
+	for (int i = 0; i != 256; i++) {
+		expectedSize += table[i].count * table[i].len;
+
+		// Words with more than 32 bits cannot be coded
+		if (table[i].len > QOI_HUFF_MAX_BIT_NUM) {
+			//printf("Words with more than 32 bits (%d) cannot be coded\n", table[i].len);
+			return bytes;
+		}
+	}
+	expectedSize /= 8;
+
+	// Don't bother, we won't even save 3% space
+	if (expectedSize > 10 * 1024 && expectedSize > p * 0.97) {
+		//printf("Don't bother, we won't even save 3%% space\n");
+		return bytes;
+	}
+
+	expectedSize = expectedSize + (4 - expectedSize % 4) % 4 + 8;
+	unsigned int *huffwords = (unsigned int*) malloc( expectedSize );
+	if (!huffwords) {
+		return NULL;
+	}
+
+	p = 0;
+	unsigned char* huffbytes = (unsigned char*)huffwords;
+	qoi_write_32(huffbytes, &p, QOI_MAGIC);
+	qoi_write_32(huffbytes, &p, desc->width);
+	qoi_write_32(huffbytes, &p, desc->height);
+	huffbytes[p++] = desc->channels;
+	huffbytes[p++] = desc->colorspace | QOI_HUFF_ENCODED_BIT;
+
+	for (int i = 0; i != 256; i++) {
+		huffbytes[p++] = table[i].len;
+		if (table[i].len > 24) {
+			qoi_write_32(huffbytes, &p, table[i].bits);
+		}
+		else if(table[i].len > 16) {
+			qoi_write_24(huffbytes, &p, table[i].bits);
+		}
+		else {
+			qoi_write_16(huffbytes, &p, table[i].bits);
+		}
+	}
+
+
+	// Round up to the next full word boundry
+	unsigned int wordIdx = (p / 4) + (p % 4 ? 1 : 0); unsigned int huffOffset = wordIdx * 4;
+	unsigned int bitIdx = 0;
+	huffwords[wordIdx] = 0;
+	for (int i = QOI_HEADER_SIZE; i != qoiByteCount; i++) {
+		unsigned int bits= table[bytes[i]].bits;
+		unsigned int len= table[bytes[i]].len;
+
+		huffwords[wordIdx] |= (bits << bitIdx) & ~( (~0) << 32 );
+
+		unsigned int newBitIdx= bitIdx + len;
+
+		bitIdx = newBitIdx % 32;
+
+		// Move to the next word and clear it
+		if (newBitIdx >= 32) {
+			huffwords[++wordIdx] = 0;
+		}
+
+		// Store the overflown bits in the new word
+		if (newBitIdx > 32) {
+			huffwords[wordIdx] |= (bits >> (len- bitIdx));
+		}
+	}
+
+
+	//for (int i = 0; i != 64; i++) {
+	//	printf("huffbyte [%d]: %x\n", i, huffbytes[i+ huffOffset]);
+	//}
+
+	huffwords[++wordIdx] = 0;
+	*out_len = wordIdx * 4 + 4;
+	//printf("size: %d\n", *out_len);
+
+	free(bytes);
+
+	return huffbytes;
+}
+
+
+
+
+
+
+void qoi_decode_buffer( const unsigned char* bytes, int p, unsigned char* pixels, int size, int px_len, int channels ) {
+	int chunks_len, px_pos;
+	int run = 0;
+	qoi_rgba_t index[64];
+	qoi_rgba_t px;
+
+	QOI_ZEROARR(index);
+	px.rgba.r = 0;
+	px.rgba.g = 0;
+	px.rgba.b = 0;
+	px.rgba.a = 255;
+
+	chunks_len = size - (int)sizeof(qoi_padding);
+	for (px_pos = 0; px_pos < px_len; px_pos += channels) {
+		if (run > 0) {
+			run--;
+		}
+		else if (p < chunks_len) {
+			int b1 = bytes[p++];
+
+			if (b1 == QOI_OP_RGB) {
+				px.rgba.r = bytes[p++];
+				px.rgba.g = bytes[p++];
+				px.rgba.b = bytes[p++];
+			}
+			else if (b1 == QOI_OP_RGBA) {
+				px.rgba.r = bytes[p++];
+				px.rgba.g = bytes[p++];
+				px.rgba.b = bytes[p++];
+				px.rgba.a = bytes[p++];
+			}
+			else if ((b1 & QOI_MASK_2) == QOI_OP_INDEX) {
+				px = index[b1];
+			}
+			else if ((b1 & QOI_MASK_2) == QOI_OP_DIFF) {
+				px.rgba.r += ((b1 >> 4) & 0x03) - 2;
+				px.rgba.g += ((b1 >> 2) & 0x03) - 2;
+				px.rgba.b += (b1 & 0x03) - 2;
+			}
+			else if ((b1 & QOI_MASK_2) == QOI_OP_LUMA) {
+				int b2 = bytes[p++];
+				int vg = (b1 & 0x3f) - 32;
+				px.rgba.r += vg - 8 + ((b2 >> 4) & 0x0f);
+				px.rgba.g += vg;
+				px.rgba.b += vg - 8 + (b2 & 0x0f);
+			}
+			else if ((b1 & QOI_MASK_2) == QOI_OP_RUN) {
+				run = (b1 & 0x3f);
+			}
+
+			index[QOI_COLOR_HASH(px) % 64] = px;
+		}
+
+		if (channels == 4) {
+			*(qoi_rgba_t*)(pixels + px_pos) = px;
+		}
+		else {
+			pixels[px_pos + 0] = px.rgba.r;
+			pixels[px_pos + 1] = px.rgba.g;
+			pixels[px_pos + 2] = px.rgba.b;
+		}
+	}
+}
+
+typedef struct {
+	union {
+		struct {
+			//unsigned int bits;
+			unsigned char len;
+			unsigned char byteValue;
+		} leaf;
+
+		struct {
+			short left;
+			short right;
+		} node;
+	} data;
+	unsigned char isLeaf;
+} decoding_tree_t;
+
+__forceinline unsigned char huff_decode_next_byte(const unsigned int* words, unsigned int* wordIdx, unsigned int* bitIdx, int size, const unsigned short* table, const decoding_tree_t* tree) {
+	if (*wordIdx + 1 >= size / 4) {
+		//printf("unexpected eof\n", size);
+		return 0;
+	}
+
+	uint64_t bits = *((uint64_t*)(words + *wordIdx));
+	bits = bits >> *bitIdx;
+
+	unsigned int leadingBits = (bits & ~((~0) << QOI_HUFF_DECODING_TABLE_WIDTH));
+	unsigned int trailingBits = bits >> QOI_HUFF_DECODING_TABLE_WIDTH;
+
+	unsigned char byteValue;
+	unsigned int len;
+
+	// Table entry is either the decoded value or a decision tree
+	unsigned short entry = table[leadingBits];
+	assert(entry);
+	if (!(entry & (1 << 15))) {
+		byteValue= entry & 0xff;
+		len = entry >> 8;
+	}
+	else {
+		// Walk the tree until decoded value is found
+		unsigned short node = entry & ~(1 << 15);
+		while (!tree[node].isLeaf) {
+			node = trailingBits & 1 ? tree[node].data.node.right : tree[node].data.node.left;
+			trailingBits = trailingBits >> 1;
+		}
+
+		byteValue = tree[node].data.leaf.byteValue;
+		len = tree[node].data.leaf.len;
+	}
+
+	// Move to next word on overflow
+	*bitIdx += len;
+	if (*bitIdx >= 32) {
+		(*wordIdx)++;
+	}
+	*bitIdx %= 32;
+
+	return byteValue;
+}
+
+int qoi_huff_decode_buffer(const unsigned char* bytes, int p, unsigned char* pixels, int size, int px_len, int channels) {
+	int px_pos;
+	int run = 0;
+	qoi_rgba_t index[64];
+	qoi_rgba_t px;
+	
+	unsigned short table[1 << QOI_HUFF_DECODING_TABLE_WIDTH];		// 11bit lookup table
+	decoding_tree_t treeNodes[512];									// decision tree nodes
+	int nextFreeNode= 0;											// basic arena allocator
+
+
+	QOI_ZEROARR(table);
+
+	
+	// Read 256 dictonary entries
+	for (int byteValue = 0; byteValue != 256; byteValue++) {
+		// Get word length and word bits
+		if (p >= size) {
+			return -1;
+		}
+		unsigned len = bytes[p++];
+		unsigned int bits;
+		if (len > 24) {
+			if (p + 4 > size) {
+				return -1;
+			}
+
+			bits = qoi_read_32(bytes, &p);
+		}
+		else if (len > 16) {
+			if (p + 3 > size) {
+				return -1;
+			}
+
+			bits = qoi_read_24(bytes, &p);
+
+		}
+		else {
+			if (p + 2 > size) {
+				return -1;
+			}
+
+			bits = qoi_read_16(bytes, &p);
+		}
+
+		// Make entry for short code words
+		if (len <= QOI_HUFF_DECODING_TABLE_WIDTH) {
+			unsigned int paddingCount = QOI_HUFF_DECODING_TABLE_WIDTH - len;
+			unsigned int spanLength = 1 << paddingCount;
+
+			for (int i = 0; i != spanLength; i++) {
+				unsigned int idx = (i << len) | bits;
+
+				assert(table[idx] == 0);
+				table[idx] = ((len & 0x3f) << 8) | byteValue;
+			}
+		}
+		// Make a lookup tree for long code words
+		else {
+			unsigned int leadingLength = len - QOI_HUFF_DECODING_TABLE_WIDTH;
+			unsigned int truncatedBits = bits & ~( (~0) << QOI_HUFF_DECODING_TABLE_WIDTH);
+			unsigned int leadingBits = bits >> QOI_HUFF_DECODING_TABLE_WIDTH;
+
+
+			// Allocate new root node
+			unsigned short treeIdx = table[truncatedBits];
+			assert(treeIdx == 0 || treeIdx & (1 << 15));
+			if (!treeIdx) {
+				treeIdx = nextFreeNode++;
+				table[truncatedBits] = treeIdx | (1 << 15);
+
+				treeNodes[treeIdx] = (decoding_tree_t){
+					.data = {
+						.node = {
+							.left= -1,
+							.right= -1
+						}
+					},
+					.isLeaf = 0
+				};
+			}
+			// Get root node index
+			else {
+				treeIdx = treeIdx & ~(1 << 15);
+			}
+
+			// Build / Walk tree for all remaining leading bits that don't fit into the 11bit table index
+			for (int i = 0; i != leadingLength; i++) {
+				unsigned int bit = leadingBits & 1;
+				leadingBits >>= 1;
+
+				// Create leaf node at the end of the tree
+				if (i == leadingLength - 1) {
+					// Alloc node
+					short entryIdx = nextFreeNode++;
+					treeNodes[entryIdx] = (decoding_tree_t){
+						.data = {
+							.leaf = {
+								//.bits = bits,
+								.len = (unsigned char)len,
+								.byteValue = (unsigned char)byteValue
+							}
+						},
+						.isLeaf = 1
+					};
+
+					// Attach to the tree
+					if (bit) {
+						assert(!treeNodes[treeIdx].isLeaf && treeNodes[treeIdx].data.node.right < 0);
+						treeNodes[treeIdx].data.node.right = entryIdx;
+					}
+					else {
+						assert(!treeNodes[treeIdx].isLeaf && treeNodes[treeIdx].data.node.left < 0);
+						treeNodes[treeIdx].data.node.left = entryIdx;
+					}
+				}
+				// Move to the next node down
+				else {
+					// Allocate new node if none is present yet
+					assert(!treeNodes[treeIdx].isLeaf);
+					short nextNode = bit ? treeNodes[treeIdx].data.node.right : treeNodes[treeIdx].data.node.left;
+					if (nextNode < 0) {
+						nextNode = nextFreeNode++;
+						treeNodes[nextNode] = (decoding_tree_t){
+							.data = {
+								.node = {
+									.left= -1,
+									.right= -1
+								}
+							},
+							.isLeaf = 0
+						};
+
+						// Attach newly allocated node
+						if (bit) {
+							assert(treeNodes[treeIdx].data.node.right < 0);
+							treeNodes[treeIdx].data.node.right = nextNode;
+						}
+						else {
+							assert(treeNodes[treeIdx].data.node.left < 0);
+							treeNodes[treeIdx].data.node.left = nextNode;
+						}
+					}
+
+					treeIdx = nextNode;
+				}
+			}
+		}
+	}
+
+	const unsigned int* words = (const unsigned int*)bytes;
+	unsigned int wordIdx = (p / 4) + (p % 4 ? 1 : 0);
+	unsigned int bitIdx = 0;
+
+	// Decode qoi from the stram of huff decoded bytes
+	QOI_ZEROARR(index);
+	px.rgba.r = 0;
+	px.rgba.g = 0;
+	px.rgba.b = 0;
+	px.rgba.a = 255;
+
+	for (px_pos = 0; px_pos < px_len; px_pos += channels) {
+		if (run > 0) {
+			run--;
+		}
+		else {
+			int b1 = huff_decode_next_byte(words, &wordIdx, &bitIdx, size, table, treeNodes);
+			if (wordIdx * 4 >= size) {
+				continue;
+			}
+
+			if (b1 == QOI_OP_RGB) {
+				px.rgba.r = huff_decode_next_byte(words, &wordIdx, &bitIdx, size, table, treeNodes);
+				px.rgba.g = huff_decode_next_byte(words, &wordIdx, &bitIdx, size, table, treeNodes);
+				px.rgba.b = huff_decode_next_byte(words, &wordIdx, &bitIdx, size, table, treeNodes);
+			}
+			else if (b1 == QOI_OP_RGBA) {
+				px.rgba.r = huff_decode_next_byte(words, &wordIdx, &bitIdx, size, table, treeNodes);
+				px.rgba.g = huff_decode_next_byte(words, &wordIdx, &bitIdx, size, table, treeNodes);
+				px.rgba.b = huff_decode_next_byte(words, &wordIdx, &bitIdx, size, table, treeNodes);
+				px.rgba.a = huff_decode_next_byte(words, &wordIdx, &bitIdx, size, table, treeNodes);
+			}
+			else if ((b1 & QOI_MASK_2) == QOI_OP_INDEX) {
+				px = index[b1];
+			}
+			else if ((b1 & QOI_MASK_2) == QOI_OP_DIFF) {
+				px.rgba.r += ((b1 >> 4) & 0x03) - 2;
+				px.rgba.g += ((b1 >> 2) & 0x03) - 2;
+				px.rgba.b += (b1 & 0x03) - 2;
+			}
+			else if ((b1 & QOI_MASK_2) == QOI_OP_LUMA) {
+				int b2 = huff_decode_next_byte(words, &wordIdx, &bitIdx, size, table, treeNodes);
+				int vg = (b1 & 0x3f) - 32;
+				px.rgba.r += vg - 8 + ((b2 >> 4) & 0x0f);
+				px.rgba.g += vg;
+				px.rgba.b += vg - 8 + (b2 & 0x0f);
+			}
+			else if ((b1 & QOI_MASK_2) == QOI_OP_RUN) {
+				run = (b1 & 0x3f);
+			}
+
+			index[QOI_COLOR_HASH(px) % 64] = px;
+		}
+
+		if (channels == 4) {
+			*(qoi_rgba_t*)(pixels + px_pos) = px;
+		}
+		else {
+			pixels[px_pos + 0] = px.rgba.r;
+			pixels[px_pos + 1] = px.rgba.g;
+			pixels[px_pos + 2] = px.rgba.b;
+		}
+	}
+
+	return 0;
+}
+
+
+
+void* qoi_huff_decode(const void* data, int size, qoi_desc* desc, int channels) {
+	const unsigned char* bytes;
+	unsigned int header_magic;
+	unsigned char* pixels;
+	int p = 0;
+
+	if (
+		data == NULL || desc == NULL ||
+		(channels != 0 && channels != 3 && channels != 4) ||
+		size < QOI_HEADER_SIZE + (int)sizeof(qoi_padding)
+		) {
+		return NULL;
+	}
+
+	bytes = (const unsigned char*)data;
+
+	header_magic = qoi_read_32(bytes, &p);
+	desc->width = qoi_read_32(bytes, &p);
+	desc->height = qoi_read_32(bytes, &p);
+	desc->channels = bytes[p++];
+	desc->colorspace = bytes[p++];
+
+	int isHuffEncoded = desc->colorspace & QOI_HUFF_ENCODED_BIT;
+	desc->colorspace &= ~QOI_HUFF_ENCODED_BIT;
+
+	if (
+		desc->width == 0 || desc->height == 0 ||
+		desc->channels < 3 || desc->channels > 4 ||
+		desc->colorspace > 1 ||
+		header_magic != QOI_MAGIC ||
+		desc->height >= QOI_PIXELS_MAX / desc->width
+		) {
+		return NULL;
+	}
+
+	if (channels == 0) {
+		channels = desc->channels;
+	}
+
+	int px_len = desc->width * desc->height * channels;
+	pixels = (unsigned char*)QOI_MALLOC(px_len);
+	if (!pixels) {
+		return NULL;
+	}
+
+	if (!isHuffEncoded) {
+		qoi_decode_buffer( bytes, p, pixels, size, px_len, channels );
+		return pixels;
+	}
+
+	qoi_huff_decode_buffer(bytes, p, pixels, size, px_len, channels);
+	return pixels;
+}
+
+
+
+
 #ifndef QOI_NO_STDIO
 #include <stdio.h>
 
-int qoi_write(const char *filename, const void *data, const qoi_desc *desc) {
-	FILE *f = fopen(filename, "wb");
+int qoi_write(const char* filename, const void* data, const qoi_desc* desc) {
+	FILE* f = fopen(filename, "wb");
 	int size;
-	void *encoded;
+	void* encoded;
 
 	if (!f) {
 		return 0;
@@ -636,10 +1491,10 @@ int qoi_write(const char *filename, const void *data, const qoi_desc *desc) {
 	return size;
 }
 
-void *qoi_read(const char *filename, qoi_desc *desc, int channels) {
-	FILE *f = fopen(filename, "rb");
+void* qoi_read(const char* filename, qoi_desc* desc, int channels) {
+	FILE* f = fopen(filename, "rb");
 	int size, bytes_read;
-	void *pixels, *data;
+	void* pixels, * data;
 
 	if (!f) {
 		return NULL;
